@@ -42,15 +42,15 @@ type Master struct {
 func (m* Master) isMapTaskFinished() bool {
 	return m.finishedMapTaskCnt == m.nMap
 }
-func (m* Master) setFinished(taskType string, taskNumber int) bool { 
-	if taskType == "map" {
+func (m* Master) setFinished(TaskType string, taskNumber int) bool { 
+	if TaskType == "map" {
 		if m.mapTaskState[taskNumber].state == 2 {
 			//already finished
 			return false
 		}
 		m.mapTaskState[taskNumber].state = 2
 		m.finishedMapTaskCnt++
-	} else if taskType == "reduce" {
+	} else if TaskType == "reduce" {
 		if m.reduceTaskState[taskNumber].state == 2 {
 			//already finished
 			return false
@@ -78,17 +78,17 @@ func (m *Master) GetTask(args *TaskApply, reply *TaskReply) error {
 		}
 	}
 	if mapTaskNumber!=-1 { // assign a map task and return
-		reply.taskType = "map"
-		reply.taskNumber = mapTaskNumber
-		reply.inputFileName = m.inputFiles[mapTaskNumber]
-		reply.nMap = m.nMap
-		reply.nReduce = m.nReduce
+		reply.TaskType = "map"
+		reply.TaskNumber = mapTaskNumber
+		reply.InputFileName = m.inputFiles[mapTaskNumber]
+		reply.NMap = m.nMap
+		reply.NReduce = m.nReduce
 		//set start time and state
 		m.mapTaskState[mapTaskNumber].setInProgress()
 		return nil
 	}
 	if(!m.isMapTaskFinished()) {
-		reply.taskType="wait"
+		reply.TaskType="wait"
 		return nil
 	}
 	//if map task fully done , assemble reduce task 
@@ -105,10 +105,10 @@ func (m *Master) GetTask(args *TaskApply, reply *TaskReply) error {
 		return nil
 	}
 	// assign a reduce task
-	reply.taskType = "reduce"
-	reply.taskNumber = reduceTaskNumber
-	reply.nMap = m.nMap
-	reply.nReduce = m.nReduce
+	reply.TaskType = "reduce"
+	reply.TaskNumber = reduceTaskNumber
+	reply.NMap = m.nMap
+	reply.NReduce = m.nReduce
 	m.reduceTaskState[reduceTaskNumber].setInProgress()
 	return nil
 }
@@ -118,7 +118,7 @@ func (m* Master) HandinTask(args * TaskHandinApply,reply* string) error {
 	// this function will be called concurrently 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	res := m.setFinished(args.taskType,args.taskNumber)
+	res := m.setFinished(args.TaskType,args.TaskNumber)
 	if(!res){
 		// return error
 	}
@@ -158,7 +158,7 @@ func (m *Master) server() {
 //
 func (m *Master) Done() bool {
 	// Your code here.
-	return m.isDone
+	return m.finishedMapTaskCnt==m.nMap&&m.finishedReduceTaskCnt==m.nReduce
 }
 
 //

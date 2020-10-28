@@ -53,23 +53,23 @@ func Worker(mapf func(string, string) []KeyValue,
 			log.Fatalf("Rpc call failed")
 			break
 		}
-		if applyResult.taskType == "wait" { //wait until map tasks finished
+		if applyResult.TaskType == "wait" { //wait until map tasks finished
 			time.Sleep(time.Second)
 		} else {
 			break
 		}
 
 	}
-	if applyResult.taskType == "map" {
+	if applyResult.TaskType == "map" {
 		HandleMap(applyResult,mapf)
-	} else if applyResult.taskType == "reduce" {
+	} else if applyResult.TaskType == "reduce" {
 		HandleReduce(applyResult,reducef)
 	}
 }
 
 func HandleMap(taskReply TaskReply,mapf func(string, string) []KeyValue) {
-	filename := taskReply.inputFileName
-	taskNumber := taskReply.taskNumber
+	filename := taskReply.InputFileName
+	taskNumber := taskReply.TaskNumber
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot open %v", filename)
@@ -83,7 +83,7 @@ func HandleMap(taskReply TaskReply,mapf func(string, string) []KeyValue) {
 	// write every kv to target intermediate files
 	// create temarary files array ,index is the number of reducer
 	var tmpFileArr []*os.File // 数组里面存的是struct pointer
-	for i:=0; i<taskReply.nReduce; i++{
+	for i:=0; i<taskReply.NReduce; i++{
 		//mr-mapTaskNum-reduceTaskNum
 		tmpfileName:="mr-"+strconv.Itoa(taskNumber)+"-"+strconv.Itoa(i)
 		tmpfile , err := ioutil.TempFile("",tmpfileName)
@@ -94,7 +94,7 @@ func HandleMap(taskReply TaskReply,mapf func(string, string) []KeyValue) {
 		tmpFileArr=append(tmpFileArr,tmpfile)
 	}
 	for _ , kv :=  range kva {
-		p := ihash(kv.Key)%taskReply.nReduce
+		p := ihash(kv.Key)%taskReply.NReduce
 		enc:=json.NewEncoder(tmpFileArr[p])
 		err:=enc.Encode(kv)
 		if err!=nil {
@@ -102,7 +102,7 @@ func HandleMap(taskReply TaskReply,mapf func(string, string) []KeyValue) {
 		}
 	}
 	// rename temparary files atomicly
-	for i:=0;i<taskReply.nReduce;i++ {
+	for i:=0;i<taskReply.NReduce;i++ {
 		// file name:mr-mapTaskNum-reduceTaskNum
 		os.Rename("mr-"+strconv.Itoa(taskNumber)+"-"+strconv.Itoa(i),"mr-"+strconv.Itoa(taskNumber)+"-"+strconv.Itoa(i))
 		//file.close() ?	
@@ -110,14 +110,14 @@ func HandleMap(taskReply TaskReply,mapf func(string, string) []KeyValue) {
 	// send done messages to master
 	args := TaskHandinApply{}
 	reply := ""
-	args.taskType = "map"
-	args.taskNumber = taskNumber
+	args.TaskType = "map"
+	args.TaskNumber = taskNumber
 	call("Master.HandinTask",&args,&reply)
 }
 
 func HandleReduce(taskReply TaskReply,reducef func(string, []string) string) {
-	nReduce := taskReply.nReduce
-	reduceNumber := taskReply.taskNumber
+	nReduce := taskReply.NReduce
+	reduceNumber := taskReply.TaskNumber
 	intermediateKV := []KeyValue{}
 	//read nMap input files and append to intermediateKV array, how to handle memory overflow?
 	for i:=0; i<nReduce; i++ {
@@ -169,8 +169,8 @@ func HandleReduce(taskReply TaskReply,reducef func(string, []string) string) {
 	// submit result to master
 	args := TaskHandinApply{}
 	reply := ""
-	args.taskType = "reduce"
-	args.taskNumber = reduceNumber
+	args.TaskType = "reduce"
+	args.TaskNumber = reduceNumber
 	call("Master.HandinTask",&args,&reply)
 }
 //

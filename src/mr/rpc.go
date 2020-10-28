@@ -24,21 +24,20 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 type TaskApply struct{
-	serverState int
-	
+	ServerState int
 }
 
 type TaskReply struct{
-	taskType string // value : mapper reducer exit
-	taskNumber int // task number assigned by master
-	inputFileName string // input file name
-	nReduce int // number of reducer
-	nMap int // number of mapper
+	TaskType string // value : mapper reducer exit
+	TaskNumber int // task number assigned by master
+	InputFileName string // input file name
+	NReduce int // number of reducer
+	NMap int // number of mapper
 }
 
 type TaskHandinApply struct {
-	taskType string // value : map or reducet
-	taskNumber int // task number 
+	TaskType string // value : map or reducet
+	TaskNumber int // task number 
 }
 
 // Cook up a unique-ish UNIX-domain socket name
