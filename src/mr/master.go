@@ -5,14 +5,125 @@ import "net"
 import "os"
 import "net/rpc"
 import "net/http"
+import "time"
+import "sync"
 
-
+type TaskState struct {
+	state int // task state 0:idel 1:in progress 2:done
+	startTime time.Time // task started time 
+}
+// return true if the task timeout 
+func (t *TaskState) isTimeOut() bool { 
+	// represents the elapsed time between two instants as an int64 nanosecond count.
+	elapsed := time.Now().Sub(t.startTime)
+	return elapsed>(1e10)
+}
+// set task state = 1 ,start time = now 
+func (t *TaskState) setInProgress() {
+	t.state = 1;
+	t.startTime = time.Now()
+}
+func (t *TaskState) excutable() bool {
+	return t.state==1||(t.state==2&&t.isTimeOut())
+}
 type Master struct {
 	// Your definitions here.
-
+	nMap int // number of map task
+	nReduce int // number of reduce task
+	inputFiles []string // input file names
+	mapTaskState []TaskState 
+	reduceTaskState []TaskState
+	finishedMapTaskCnt int // number of finished map task
+	finishedReduceTaskCnt int // number of finished reduce task
+	isDone bool // is the task fully done
+	mu sync.Mutex // mutex
+}
+// return true if all map tasks finished
+func (m* Master) isMapTaskFinished() bool {
+	return m.finishedMapTaskCnt == m.nMap
+}
+func (m* Master) setFinished(taskType string, taskNumber int) bool { 
+	if taskType == "map" {
+		if m.mapTaskState[taskNumber].state == 2 {
+			//already finished
+			return false
+		}
+		m.mapTaskState[taskNumber].state = 2
+		m.finishedMapTaskCnt++
+	} else if taskType == "reduce" {
+		if m.reduceTaskState[taskNumber].state == 2 {
+			//already finished
+			return false
+		}
+		m.reduceTaskState[taskNumber].state = 2
+		m.finishedReduceTaskCnt++
+	} else {
+		return false
+	}
+	return true
 }
 
 // Your code here -- RPC handlers for the worker to call.
+func (m *Master) GetTask(args *TaskApply, reply *TaskReply) error {
+
+	// this function will be called concurrently 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// assemble map task first
+	mapTaskNumber := -1
+	for i:=0;i<m.nMap;i++{
+		if m.mapTaskState[i].excutable() {// task not started or not finished and timeout
+			mapTaskNumber = i	
+			break;
+		}
+	}
+	if mapTaskNumber!=-1 { // assign a map task and return
+		reply.taskType = "map"
+		reply.taskNumber = mapTaskNumber
+		reply.inputFileName = m.inputFiles[mapTaskNumber]
+		reply.nMap = m.nMap
+		reply.nReduce = m.nReduce
+		//set start time and state
+		m.mapTaskState[mapTaskNumber].setInProgress()
+		return nil
+	}
+	if(!m.isMapTaskFinished()) {
+		reply.taskType="wait"
+		return nil
+	}
+	//if map task fully done , assemble reduce task 
+	reduceTaskNumber := -1
+	for i:=0; i<m.nReduce; i++ {
+		if m.reduceTaskState[i].excutable() {// task not started or not finished and timeout
+			reduceTaskNumber = i
+			break;
+		}
+	}
+	//no reduce task
+	if reduceTaskNumber==-1 {
+		// log.error()
+		return nil
+	}
+	// assign a reduce task
+	reply.taskType = "reduce"
+	reply.taskNumber = reduceTaskNumber
+	reply.nMap = m.nMap
+	reply.nReduce = m.nReduce
+	m.reduceTaskState[reduceTaskNumber].setInProgress()
+	return nil
+}
+
+// RPC : work call this when a task is done
+func (m* Master) HandinTask(args * TaskHandinApply,reply* string) error {
+	// this function will be called concurrently 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	res := m.setFinished(args.taskType,args.taskNumber)
+	if(!res){
+		// return error
+	}
+	return nil
+}
 
 //
 // an example RPC handler.
@@ -46,12 +157,8 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := false
-
 	// Your code here.
-
-
-	return ret
+	return m.isDone
 }
 
 //
@@ -63,7 +170,12 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
 	// Your code here.
-
+	m.nMap=len(files)
+	m.nReduce=nReduce
+	m.inputFiles=files // cppy array
+	m.mapTaskState = make([]TaskState,m.nMap,m.nMap)
+	m.reduceTaskState = make([]TaskState,nReduce,nReduce)
+	m.isDone = false
 
 	m.server()
 	return &m
