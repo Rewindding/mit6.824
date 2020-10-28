@@ -16,7 +16,7 @@ type TaskState struct {
 func (t *TaskState) isTimeOut() bool { 
 	// represents the elapsed time between two instants as an int64 nanosecond count.
 	elapsed := time.Now().Sub(t.startTime)
-	return elapsed>(1e10)
+	return elapsed>(10*time.Second)
 }
 // set task state = 1 ,start time = now 
 func (t *TaskState) setInProgress() {

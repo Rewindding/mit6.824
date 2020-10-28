@@ -47,7 +47,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 	applyArgs := TaskApply{}
 	applyResult :=TaskReply{}
-	for {
+	for { // try to get a task
 		res := call("Master.GetTask",&applyArgs,&applyResult)
 		if(!res) { //something wrong in rpc  
 			log.Fatalf("Rpc call failed")
@@ -61,11 +61,10 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	}
 	if applyResult.taskType == "map" {
-
+		HandleMap(applyResult,mapf)
 	} else if applyResult.taskType == "reduce" {
-		
+		HandleReduce(applyResult,reducef)
 	}
-
 }
 
 func HandleMap(taskReply TaskReply,mapf func(string, string) []KeyValue) {
@@ -113,7 +112,7 @@ func HandleMap(taskReply TaskReply,mapf func(string, string) []KeyValue) {
 	reply := ""
 	args.taskType = "map"
 	args.taskNumber = taskNumber
-	call("Master.HandinTask",args,reply)
+	call("Master.HandinTask",&args,&reply)
 }
 
 func HandleReduce(taskReply TaskReply,reducef func(string, []string) string) {
@@ -172,7 +171,7 @@ func HandleReduce(taskReply TaskReply,reducef func(string, []string) string) {
 	reply := ""
 	args.taskType = "reduce"
 	args.taskNumber = reduceNumber
-	call("Master.HandinTask",args,reply)
+	call("Master.HandinTask",&args,&reply)
 }
 //
 // example function to show how to make an RPC call to the master.
