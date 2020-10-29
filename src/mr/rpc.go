@@ -33,6 +33,7 @@ type TaskReply struct{
 	InputFileName string // input file name
 	NReduce int // number of reducer
 	NMap int // number of mapper
+	Finished bool // if all task done
 }
 
 type TaskHandinApply struct {

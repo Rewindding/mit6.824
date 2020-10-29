@@ -24,7 +24,7 @@ func (t *TaskState) setInProgress() {
 	t.startTime = time.Now()
 }
 func (t *TaskState) excutable() bool {
-	return t.state==1||(t.state==2&&t.isTimeOut())
+	return t.state==0||(t.state==1&&t.isTimeOut())
 }
 type Master struct {
 	// Your definitions here.
@@ -48,6 +48,7 @@ func (m* Master) setFinished(TaskType string, taskNumber int) bool {
 			//already finished
 			return false
 		}
+		log.Printf("map task:%v finised",taskNumber)
 		m.mapTaskState[taskNumber].state = 2
 		m.finishedMapTaskCnt++
 	} else if TaskType == "reduce" {
@@ -55,6 +56,7 @@ func (m* Master) setFinished(TaskType string, taskNumber int) bool {
 			//already finished
 			return false
 		}
+		log.Printf("reduce task:%v finised",taskNumber)
 		m.reduceTaskState[taskNumber].state = 2
 		m.finishedReduceTaskCnt++
 	} else {
@@ -69,6 +71,10 @@ func (m *Master) GetTask(args *TaskApply, reply *TaskReply) error {
 	// this function will be called concurrently 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.Done() { // all task finished
+		reply.Finished = true
+		return nil
+	}
 	// assemble map task first
 	mapTaskNumber := -1
 	for i:=0;i<m.nMap;i++{
@@ -85,9 +91,11 @@ func (m *Master) GetTask(args *TaskApply, reply *TaskReply) error {
 		reply.NReduce = m.nReduce
 		//set start time and state
 		m.mapTaskState[mapTaskNumber].setInProgress()
+		log.Printf("assign a map task number:%v,totall:%v\n",mapTaskNumber,m.nMap);
 		return nil
 	}
 	if(!m.isMapTaskFinished()) {
+		log.Printf("assign a wait task\n");
 		reply.TaskType="wait"
 		return nil
 	}
@@ -96,12 +104,11 @@ func (m *Master) GetTask(args *TaskApply, reply *TaskReply) error {
 	for i:=0; i<m.nReduce; i++ {
 		if m.reduceTaskState[i].excutable() {// task not started or not finished and timeout
 			reduceTaskNumber = i
-			break;
+			break
 		}
 	}
 	//no reduce task
 	if reduceTaskNumber==-1 {
-		// log.error()
 		return nil
 	}
 	// assign a reduce task
@@ -110,6 +117,7 @@ func (m *Master) GetTask(args *TaskApply, reply *TaskReply) error {
 	reply.NMap = m.nMap
 	reply.NReduce = m.nReduce
 	m.reduceTaskState[reduceTaskNumber].setInProgress()
+	log.Printf("assign a reduce task number:%v\n",reduceTaskNumber);
 	return nil
 }
 
@@ -120,8 +128,10 @@ func (m* Master) HandinTask(args * TaskHandinApply,reply* string) error {
 	defer m.mu.Unlock()
 	res := m.setFinished(args.TaskType,args.TaskNumber)
 	if(!res){
+		log.Printf("%v number %v handin failed\n",args.TaskType,args.TaskNumber)
 		// return error
 	}
+	log.Printf("%v number %v handin succeed\n",args.TaskType,args.TaskNumber)
 	return nil
 }
 
@@ -176,7 +186,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m.mapTaskState = make([]TaskState,m.nMap,m.nMap)
 	m.reduceTaskState = make([]TaskState,nReduce,nReduce)
 	m.isDone = false
-
+	log.Printf("new master: nMap:%v,nReducer:%v\n",m.nMap,m.nReduce)
 	m.server()
 	return &m
 }

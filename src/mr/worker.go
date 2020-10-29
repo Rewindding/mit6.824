@@ -48,22 +48,25 @@ func Worker(mapf func(string, string) []KeyValue,
 	applyArgs := TaskApply{}
 	applyResult :=TaskReply{}
 	for { // try to get a task
+		// log.Printf("try to get a task...")
 		res := call("Master.GetTask",&applyArgs,&applyResult)
 		if(!res) { //something wrong in rpc  
 			log.Fatalf("Rpc call failed")
 			break
 		}
+		if applyResult.Finished {
+			log.Printf("task done,worker exit")
+			return
+		}
 		if applyResult.TaskType == "wait" { //wait until map tasks finished
 			time.Sleep(time.Second)
-		} else {
-			break
+		} else if applyResult.TaskType == "map" {
+			HandleMap(applyResult,mapf)
+		} else if applyResult.TaskType == "reduce" {
+			HandleReduce(applyResult,reducef)
 		}
-
-	}
-	if applyResult.TaskType == "map" {
-		HandleMap(applyResult,mapf)
-	} else if applyResult.TaskType == "reduce" {
-		HandleReduce(applyResult,reducef)
+		applyArgs = TaskApply{}
+		applyResult = TaskReply{}
 	}
 }
 
@@ -100,12 +103,13 @@ func HandleMap(taskReply TaskReply,mapf func(string, string) []KeyValue) {
 		if err!=nil {
 			log.Fatalf("encode kv %v failed",kv)
 		}
+		// log.Printf("encode kv Key:%v,Value:%v",kv.Key,kv.Value)
 	}
 	// rename temparary files atomicly
 	for i:=0;i<taskReply.NReduce;i++ {
-		// file name:mr-mapTaskNum-reduceTaskNum
-		os.Rename("mr-"+strconv.Itoa(taskNumber)+"-"+strconv.Itoa(i),"mr-"+strconv.Itoa(taskNumber)+"-"+strconv.Itoa(i))
-		//file.close() ?	
+		// file name:mr-mapTaskNum-reduceTaskNum	
+		os.Rename(tmpFileArr[i].Name(),"mr-"+strconv.Itoa(taskNumber)+"-"+strconv.Itoa(i))
+		tmpFileArr[i].Close()
 	}
 	// send done messages to master
 	args := TaskHandinApply{}
@@ -116,15 +120,15 @@ func HandleMap(taskReply TaskReply,mapf func(string, string) []KeyValue) {
 }
 
 func HandleReduce(taskReply TaskReply,reducef func(string, []string) string) {
-	nReduce := taskReply.NReduce
+	nMap := taskReply.NMap
 	reduceNumber := taskReply.TaskNumber
 	intermediateKV := []KeyValue{}
 	//read nMap input files and append to intermediateKV array, how to handle memory overflow?
-	for i:=0; i<nReduce; i++ {
+	for i:=0; i<nMap; i++ {
 		filename := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(reduceNumber)
 		file, err := os.Open(filename)
 		if err!=nil{
-			log.Fatalf("cannot open %v", filename)
+			log.Fatalf("cannot open %v,err:%v", filename,err)
 		}
 		dec := json.NewDecoder(file)
 		for {
@@ -165,7 +169,7 @@ func HandleReduce(taskReply TaskReply,reducef func(string, []string) string) {
 		values = []string{} // make values array empty
 	}
 	// atomatic rename file
-	os.Rename(ofilename,ofilename)
+	os.Rename(tofile.Name(),ofilename)
 	// submit result to master
 	args := TaskHandinApply{}
 	reply := ""
@@ -212,9 +216,11 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	err = c.Call(rpcname, args, reply)
 	if err == nil {
+		// log.Printf("%v rpc call success\n",rpcname)
 		return true
 	}
 
 	fmt.Println(err)
+	log.Printf("%v rpc call failed\n",rpcname)
 	return false
 }
