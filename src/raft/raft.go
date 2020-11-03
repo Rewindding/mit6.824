@@ -20,10 +20,18 @@ package raft
 import "sync"
 import "sync/atomic"
 import "../labrpc"
-
+import "time"
+import "math/rand"
+import "log"
 // import "bytes"
 // import "../labgob"
 
+type State string
+const (
+	Follower State = "follower"
+	Candidate State = "candidate"
+	Leader State = "leader"
+)
 
 
 //
@@ -43,6 +51,26 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+// 
+// log entry
+type LogEntry struct {
+	Term int // term
+	Index int // index
+	Command interface{} //command
+}
+
+func GetRandTimeOut() int {
+	return rand.Intn(200) + 120
+}
+// function that reset the election timeout 
+func (rf *Raft) SetElectionTO(newTimeout int) {
+	// election timeout milli second range from 10 to 500
+	// lock ? TODO: concurrency control 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.electionTimeout = newTimeout
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -56,15 +84,27 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	state State // candidate follower leader
+	term int // term number
+	votedFor int // 
+	logs []LogEntry // logs
+	commitIndex int // index of highest log entry known to be commited
+	lastApplied int // index of highest log entry known to be applied
+	electionTimeout int // election timeout milli second range from 10 to 500
+	//
+	// volatile state on leaders
+	//
+	nextIndex []int //
+	matchIndex []int //
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term := rf.term
+	isleader := (rf.state == Leader)
 	// Your code here (2A).
 	return term, isleader
 }
@@ -117,6 +157,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term int // 
+	CandidateId int //
+	LastLogIndex int //
+	LastLogTerm int //
 }
 
 //
@@ -125,13 +169,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-}
-
-//
-// example RequestVote RPC handler.
-//
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+	Term int // current term, for candidate to update itself
+	VoteGranted bool // true means receive a vote
 }
 
 //
@@ -168,7 +207,213 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type AppendEntriesArgs struct {
+	Term int
+	LeaderId int
+	PreLogIndex int
+	PreLogTerm int // -1 if not prev log
+	Entries []LogEntry
+	LeaderCommit int
+}
 
+// is the two args too few? how the leader know which rpc success ?
+type AppendEntriesReply struct {
+	Term int
+	Success bool
+}
+
+func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntryHandler", args, reply)
+	return ok
+}
+
+
+// send append entries to all other servers
+func (rf* Raft) AppendEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// should it hold the lock during the rpc calls ? will dead lock happen ?
+	if rf.state != Leader {
+		return 
+	}
+	for i , _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		// only send heart beat in lab2A
+		go func(server int, rf *Raft){
+			args := AppendEntriesArgs {
+				Term : rf.term,
+				LeaderId : rf.me,
+				LeaderCommit : rf.commitIndex,
+			}
+			reply := AppendEntriesReply{}
+			ok := rf.sendAppendEntry(server,&args,&reply)
+			if ok{
+				log.Printf("term[%v] send append entry to server %v succeed",rf.term,server)
+			}
+		}(i, rf)
+		
+	}
+	// TODO: handle append entry rpc response. lab 2A don't need
+	// using channel ? how ?
+}
+
+// append entry rpc handler , hold the raft lock until return  
+func (rf *Raft) AppendEntryHandler(args *AppendEntriesArgs, reply *AppendEntriesReply) {	
+	// get the preLogindex and pre log term 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	
+	// prepare param
+	reply.Term = rf.term
+	reply.Success = false
+	
+	if args.Term > rf.term {
+		rf.term = args.Term
+		rf.state = Follower
+	} else if args.Term < rf.term {
+		return
+	}
+	// only follower and candidate handle append entry rpc
+	if rf.state == Leader { // this should not happend in raft !
+		return
+	}
+	// reset the election timeout, already aquire the lock
+	rf.electionTimeout = GetRandTimeOut()
+	prelogindex , prelogterm := -1 , -1
+	prelogindex = len(rf.logs)-1
+	if prelogindex >= 0 { 
+		prelogterm = rf.logs[prelogindex].Term
+	}
+
+	// undate term and state
+	rf.term = args.Term
+	rf.state = Follower // turn to a follower if it's a candidate
+
+	// logs don't match 
+	if prelogindex != args.PreLogIndex || prelogterm != args.PreLogTerm { 
+		return
+	}
+
+	// accept the logs TODO optimize ,using the remaining array capacity ,then trim
+	if len(rf.logs) > args.PreLogIndex + 1 {
+		rf.logs = rf.logs[:args.PreLogIndex+1] // delete the extra entries
+	}
+	for _ , entry := range args.Entries{
+		rf.logs = append(rf.logs,entry)
+	}
+	// TODO: set commitIndex
+
+	// reply
+	reply.Success = true
+	return
+}
+
+//start a new election
+func (rf* Raft) KickOffElection() {
+	rf.mu.Lock()
+	// should lock the whole raft when election ?? no ,candidate still need to handle append entry rpc
+	// prepare args
+	// reset election timeout and start a election
+	rf.term++
+	rf.state = Candidate
+	serverCnt := len(rf.peers)
+	lastLogTerm := 0 
+	if len(rf.logs)-1 >= 0 {
+		lastLogTerm = rf.logs[len(rf.logs)-1].Term
+	}
+	args := RequestVoteArgs {
+		Term :  rf.term,
+		CandidateId : rf.me,
+		LastLogIndex : len(rf.logs)-1,
+		LastLogTerm : lastLogTerm,
+	}
+	rf.mu.Unlock()
+	var voteLock sync.Mutex //protect voteCnt, received, max_term
+	cond := sync.NewCond(&voteLock)
+	voteCnt := 1 //a candidate vote for itself
+	received := 1
+	maxTerm := -1 // max term number received during election
+	// concurrently send vote request
+	for i := 0; i < serverCnt; i++ {
+		if i == rf.me {continue} //this server itself
+		reply := RequestVoteReply{}
+		go func(server int) {
+			res := rf.sendRequestVote(server,&args,&reply)
+			voteLock.Lock()
+			defer voteLock.Unlock()
+			if res {
+				// store the vote result
+				if reply.VoteGranted {
+					log.Printf("term[%v] server[%v],get a vote from %v",rf.term,rf.me,server)
+					voteCnt++
+				}
+			}
+			received++
+			if reply.Term > maxTerm {
+				maxTerm = reply.Term
+			}
+			cond.Broadcast()
+		}(i)
+	}
+	minority := serverCnt/2
+	voteLock.Lock()
+	defer voteLock.Unlock()
+	for voteCnt <= minority && received != serverCnt && maxTerm <= rf.term {
+		cond.Wait() // wait until get enough votes or election finished or a higher term received
+		// whenever receives a response with higher term, should update term and turn to follower
+		// will cond.wait() release the lock?
+	}
+	rf.mu.Lock() // need to read the term,modify state so lock the rf
+	defer rf.mu.Unlock()
+	if maxTerm > rf.term { //turn to follower
+		rf.term = maxTerm
+		rf.state = Follower
+	} else if voteCnt > minority && args.Term == rf.term && rf.state == Candidate { // make sure now it's still a candidate
+		// become leader
+		rf.state = Leader
+		log.Printf("term[%v], server[%v] become the leader",rf.term,rf.me)
+		// how??? leader need to send append entry rpc peridically
+	} else { 
+		// should turn to follower state ?
+	}
+}
+
+//
+// example RequestVote RPC handler.
+//
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply )  {
+	// Your code here (2A, 2B).
+	// handle requst vote here
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.term
+	reply.VoteGranted = false
+
+	// how about args.term == rf.term ? make no difference.
+	if rf.votedFor >= 0 && rf.term == args.Term { // already voted in this term 
+		log.Printf("term[%v],server[%d]: server already voted for %v,reject to vote server %v",rf.term,rf.me,rf.votedFor,args.CandidateId)
+		return
+	}
+	if args.Term < rf.term {
+		log.Printf("term[%v],server[%d]: smaller term,reject to vote server %v",rf.term,rf.me,args.CandidateId)
+		return
+	} else if args.Term > rf.term {
+		rf.state = Follower
+		rf.term = args.Term
+	}
+	// only follower can vote
+	if rf.state != Follower {
+		log.Printf("term[%v],server[%d]: server not in follower state,reject to vote server %v",rf.term,rf.me,args.CandidateId)
+		return
+	}
+
+	// vote for the candidate
+	rf.votedFor = args.CandidateId
+	reply.VoteGranted = true
+}
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -231,13 +476,38 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
+	rf.votedFor = -1
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	
+	// start a background go routine to kick off election peridically
+	rf.SetElectionTO(GetRandTimeOut())
+	go func(rf* Raft){ 
+		// how to gracefully implements the election timeout??
+		for !rf.killed() { // leader dont't need election timeout
+			time.Sleep(10*time.Millisecond)
+			rf.electionTimeout -= 10
+			if rf.electionTimeout <= 0 { // start a election
+				rf.SetElectionTO(GetRandTimeOut())
+				if rf.state != Leader {
+					log.Printf("term[%v] server %v start election",rf.term,rf.me)
+					go rf.KickOffElection()
+				}
+			}
+		}
+	}(rf)
 
-
+	// peridically leader should send append entry rpc... but how to implement this ?
+	// at most ten heartbeats per second
+	go func(rf *Raft){
+		for !rf.killed() {
+			time.Sleep(100*time.Millisecond)
+			rf.AppendEntries()
+		}
+	}(rf)
 	return rf
 }
