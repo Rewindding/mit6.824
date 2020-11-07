@@ -22,7 +22,7 @@ import "sync/atomic"
 import "../labrpc"
 import "time"
 import "math/rand"
-import "log"
+// import "log"
 // import "bytes"
 // import "../labgob"
 
@@ -267,6 +267,10 @@ func (rf* Raft) AppendEntries() {
 			// handle response, should handle concurrency control
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
+			// if a bigger term received
+			if rf.updateTerm(reply.Term,server) {
+				return
+			}
 			if !reply.Success {
 				// not success
 				if rf.nextIndex[server]>0 {
@@ -281,7 +285,7 @@ func (rf* Raft) AppendEntries() {
 				// update leader's commit index
 				if rf.matchIndex[server] > rf.commitIndex {
 					newCommitIndex := rf.getLeaderCommit()
-					if rf.logs[newCommitIndex].Term == rf.term { // leader only update commited entry in his term
+					if newCommitIndex >rf.commitIndex && rf.logs[newCommitIndex].Term == rf.term { // leader only update commited entry in his term
 						rf.commitIndex = newCommitIndex
 					}
 				}
@@ -329,7 +333,7 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntriesArgs, reply *AppendEntries
 
 	// log consistency check
 	if prelogindex < args.PreLogIndex || prelogterm != args.PreLogTerm { 
-		log.Printf("log consistency check failed")
+		// log.Printf("log consistency check failed")
 		return
 	}
 	// only if log entry confilicts can we delete the logs in the follower
@@ -398,7 +402,7 @@ func (rf* Raft) KickOffElection() {
 			if res {
 				// store the vote result
 				if reply.VoteGranted {
-					log.Printf("term[%v] server[%v],get a vote from %v",rf.term,rf.me,server)
+					// log.Printf("term[%v] server[%v],get a vote from %v",rf.term,rf.me,server)
 					voteCnt++
 				}
 			}
@@ -425,7 +429,7 @@ func (rf* Raft) KickOffElection() {
 	} else if voteCnt > minority && args.Term == rf.term && rf.state == Candidate { // make sure now it's still a candidate
 		// become leader
 		rf.state = Leader
-		log.Printf("term[%v], server[%v] become the leader,servercnt:%v",rf.term,rf.me,serverCnt)
+		// log.Printf("term[%v], server[%v] become the leader,servercnt:%v,leaderlog:%v",rf.term,rf.me,serverCnt,rf.logs)
 		// initial nextIndex and matchIndex array
 		rf.nextIndex = []int{}
 		rf.matchIndex = []int{}
@@ -436,6 +440,7 @@ func (rf* Raft) KickOffElection() {
 		}
 	} else {
 		// should turn to follower state ?
+		rf.term -= 1
 	}
 }
 
@@ -448,26 +453,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply )  {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if args.Term > rf.term {
-		rf.state = Follower
-		rf.term = args.Term
-		rf.votedFor = -1
-	}
+	rf.updateTerm(args.Term,-1)
 
 	reply.Term = rf.term
 	reply.VoteGranted = false
 
 	if args.Term < rf.term {
-		log.Printf("term[%v],server[%d]: smaller term,reject to vote server %v",rf.term,rf.me,args.CandidateId)
+		// log.Printf("term[%v],server[%d]: smaller term,reject to vote server %v",rf.term,rf.me,args.CandidateId)
 		return
 	}
 	// only follower can vote
 	if rf.state != Follower {
-		log.Printf("term[%v],server[%d]: server not in follower state,reject to vote server %v",rf.term,rf.me,args.CandidateId)
+		// log.Printf("term[%v],server[%d]: server not in follower state,reject to vote server %v",rf.term,rf.me,args.CandidateId)
 		return
 	}
 	if rf.votedFor >= 0 && rf.term == args.Term { // already voted in this term 
-		log.Printf("term[%v],server[%d]: server already voted for %v,reject to vote server %v",rf.term,rf.me,rf.votedFor,args.CandidateId)
+		// log.Printf("term[%v],server[%d]: server already voted for %v,reject to vote server %v",rf.term,rf.me,rf.votedFor,args.CandidateId)
 		return
 	}
 	// should reset timeout here
@@ -478,6 +479,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply )  {
 	if lastLogIndex >= 0 {
 		lastLogTerm = rf.logs[lastLogIndex].Term
 	}
+	// vote restriction
 	if lastLogTerm > args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex<args.LastLogIndex) {
 		return 
 	}
@@ -518,8 +520,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term : term,
 		Command :command,
 	})
-	log.Printf("[%v] server%v,leader append a command: %v",rf.term,rf.me,command)
-	return index, term, isLeader
+	// log.Printf("[%v] server%v,leader append a command :%v",rf.term,rf.me,command)
+	return index + 1, term, isLeader
 }
 
 //
@@ -579,7 +581,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			if rf.electionTimeout <= 0 { // start a election
 				rf.SetElectionTO(GetRandTimeOut())
 				if rf.state != Leader {
-					log.Printf("term[%v] server %v start election",rf.term,rf.me)
+					// log.Printf("term[%v] server %v start election",rf.term,rf.me)
 					go rf.KickOffElection()
 				}
 			}
@@ -630,11 +632,21 @@ func (rf *Raft) commitEntries(){
 		rf.applyCh <- ApplyMsg{
 			CommandValid : true,
 			Command : rf.logs[cmdIdx].Command,
-			CommandIndex : cmdIdx,
+			CommandIndex : cmdIdx + 1, // the tester index start from 1!!!???
 		}
 		// log.Printf("[%v],server[%v],apply command:%v,idx:%v",rf.term,rf.me,rf.logs[cmdIdx].Command,cmdIdx)
 		
 	}
+}
+
+// whenever receive a term , this should be called
+// return true if recTerm > rf.term
+func (rf *Raft) updateTerm(rcvTerm,serverId int) bool {
+	if(rcvTerm<=rf.term) {return false}
+	rf.term = rcvTerm
+	rf.state = Follower
+	rf.votedFor = serverId
+	return true
 }
 
 func min(a, b int) int {
