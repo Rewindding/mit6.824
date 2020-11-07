@@ -440,7 +440,7 @@ func (rf* Raft) KickOffElection() {
 		}
 	} else {
 		// should turn to follower state ?
-		rf.term -= 1
+		// rf.term -= 1
 	}
 }
 
@@ -453,7 +453,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply )  {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.updateTerm(args.Term,-1)
 
 	reply.Term = rf.term
 	reply.VoteGranted = false
@@ -462,6 +461,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply )  {
 		// log.Printf("term[%v],server[%d]: smaller term,reject to vote server %v",rf.term,rf.me,args.CandidateId)
 		return
 	}
+	rf.updateTerm(args.Term,-1)
 	// only follower can vote
 	if rf.state != Follower {
 		// log.Printf("term[%v],server[%d]: server not in follower state,reject to vote server %v",rf.term,rf.me,args.CandidateId)
@@ -480,7 +480,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply )  {
 		lastLogTerm = rf.logs[lastLogIndex].Term
 	}
 	// vote restriction
-	if lastLogTerm > args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex<args.LastLogIndex) {
+	if lastLogTerm > args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
 		return 
 	}
 
