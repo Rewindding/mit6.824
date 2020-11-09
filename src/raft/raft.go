@@ -23,8 +23,8 @@ import "../labrpc"
 import "time"
 import "math/rand"
 // import "log"
-// import "bytes"
-// import "../labgob"
+import "bytes"
+import "../labgob"
 
 type State string
 const (
@@ -117,12 +117,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.term)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs) // this cost too much if it's not append to a file...
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
@@ -135,17 +136,16 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	
+	if d.Decode(&rf.term) != nil ||
+	   d.Decode(&rf.votedFor) != nil ||
+	   d.Decode(&rf.logs) != nil {
+		rf.term = 0
+		rf.votedFor = -1
+		rf.logs = []LogEntry{}
+	}
 }
 
 
@@ -220,6 +220,11 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term int
 	Success bool
+	
+	// parame used for fast backup
+	XTerm int  // term of the conflict entry
+	XIndex int // index of the first entry of the xTerm
+	XLen int // length of the follower's log
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -242,6 +247,7 @@ func (rf* Raft) AppendEntries() {
 			continue
 		}
 		go func(server int, rf *Raft) {
+			rf.mu.Lock()
 			entries := []LogEntry{}
 			lastLogIndex := rf.nextIndex[server] - 1
 			lastLogTerm := -1
@@ -259,6 +265,7 @@ func (rf* Raft) AppendEntries() {
 				Entries : entries,
 				LeaderCommit : rf.commitIndex,
 			}
+			rf.mu.Unlock()
 			reply := AppendEntriesReply{}
 			ok := rf.sendAppendEntry(server,&args,&reply)
 			if !ok { // invalid response
@@ -267,31 +274,37 @@ func (rf* Raft) AppendEntries() {
 			// handle response, should handle concurrency control
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
+			if rf.term != args.Term { // stale response
+				return
+			}
 			// if a bigger term received
 			if rf.updateTerm(reply.Term,server) {
 				return
 			}
 			if !reply.Success {
 				// not success
-				if rf.nextIndex[server]>0 {
-					rf.nextIndex[server]--
-				}
+				rf.nextIndex[server] = rf.getNextIndex(reply.XTerm, reply.XIndex, reply.XLen)
+				// if out of order response(stale response) arrive, this could be wrong?
+				// rf.nextIndex shoud at leadst more than matchIndex
+				rf.nextIndex[server] = max(rf.nextIndex[server],rf.matchIndex[server]+1)
 			} else {
-				rf.nextIndex[server] += len(entries)
-				// update match index too
+				// update match index
 				if args.PreLogIndex + len(entries) > rf.matchIndex[server] {
 					rf.matchIndex[server] = args.PreLogIndex + len(entries)
 				}
+				// update nextIndex 
+				rf.nextIndex[server] = rf.matchIndex[server] + 1
 				// update leader's commit index
 				if rf.matchIndex[server] > rf.commitIndex {
 					newCommitIndex := rf.getLeaderCommit()
-					if newCommitIndex >rf.commitIndex && rf.logs[newCommitIndex].Term == rf.term { // leader only update commited entry in his term
+					if newCommitIndex > rf.commitIndex && rf.logs[newCommitIndex].Term == rf.term { // leader only update commited entry in his term
 						rf.commitIndex = newCommitIndex
 					}
 				}
 				// commit entries
 				rf.commitEntries()
 			}
+			//log.Printf("[%v] leader%v, server %v,nextIdx:%v",rf.term,rf.me,server,rf.nextIndex[server])
 		}(i, rf)	
 	}
 }
@@ -306,34 +319,27 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntriesArgs, reply *AppendEntries
 	reply.Term = rf.term
 	reply.Success = false
 	
-	if args.Term > rf.term {
-		rf.term = args.Term
-		rf.state = Follower
-		rf.votedFor = args.LeaderId
-	} else if args.Term < rf.term {
-		return
-	}
-	// only follower and candidate handle append entry rpc
-	if rf.state == Leader { // this should not happend in raft ! one term one leader guarnantee
+	// if bigger term received, handle first
+	rf.updateTerm(args.Term,args.LeaderId)
+	
+	if args.Term < rf.term {
 		return
 	}
 
 	// reset the election timeout, thread safe, already aquire the lock
 	rf.electionTimeout = GetRandTimeOut()
 
-	prelogindex , prelogterm := -1 , -1
-	prelogindex = len(rf.logs)-1
-	if prelogindex >= 0 { 
-		prelogterm = rf.logs[prelogindex].Term
+	prelogterm := -1
+	if args.PreLogIndex >= 0 && args.PreLogIndex < len(rf.logs) { 
+		prelogterm = rf.logs[args.PreLogIndex].Term
 	}
 
-	// undate term and state
-	rf.term = args.Term
 	rf.state = Follower // turn to a follower if it's a candidate
 
 	// log consistency check
-	if prelogindex < args.PreLogIndex || prelogterm != args.PreLogTerm { 
-		// log.Printf("log consistency check failed")
+	if len(rf.logs)-1 < args.PreLogIndex || prelogterm != args.PreLogTerm { 
+		// log.Printf("[%v]leader%v server%v,log consistency check failed,a.preLogidx:%v,a.preterm:%v",rf.term,args.LeaderId,rf.me,args.PreLogIndex,args.PreLogTerm)
+		reply.XTerm, reply.XIndex, reply.XLen = rf.getBackUpPara(args.PreLogIndex)
 		return
 	}
 	// only if log entry confilicts can we delete the logs in the follower
@@ -353,6 +359,7 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntriesArgs, reply *AppendEntries
 	if hasconflict {
 		rf.logs = rf.logs[:args.PreLogIndex+1+len(args.Entries)]
 	}
+	rf.persist()
 	// set commitIndex carefully or will risk excuting wrong logs
 	if args.LeaderCommit > rf.commitIndex {
 		// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
@@ -374,6 +381,7 @@ func (rf* Raft) KickOffElection() {
 	rf.term++
 	rf.state = Candidate
 	rf.votedFor = -1 //
+	rf.persist()
 	serverCnt := len(rf.peers)
 	lastLogTerm := 0 
 	if len(rf.logs)-1 >= 0 {
@@ -425,6 +433,7 @@ func (rf* Raft) KickOffElection() {
 	defer rf.mu.Unlock()
 	if maxTerm > rf.term { //turn to follower
 		rf.term = maxTerm
+		rf.persist()
 		rf.state = Follower
 	} else if voteCnt > minority && args.Term == rf.term && rf.state == Candidate { // make sure now it's still a candidate
 		// become leader
@@ -486,6 +495,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply )  {
 
 	// vote for the candidate
 	rf.votedFor = args.CandidateId
+	rf.persist()
 	reply.VoteGranted = true
 }
 //
@@ -520,6 +530,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term : term,
 		Command :command,
 	})
+	rf.persist()
 	// log.Printf("[%v] server%v,leader append a command :%v",rf.term,rf.me,command)
 	return index + 1, term, isLeader
 }
@@ -566,6 +577,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.commitIndex = -1
 	rf.lastApplied = -1
+	rf.state = Follower
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
@@ -646,7 +658,49 @@ func (rf *Raft) updateTerm(rcvTerm,serverId int) bool {
 	rf.term = rcvTerm
 	rf.state = Follower
 	rf.votedFor = serverId
+	rf.persist()
 	return true
+}
+
+//
+// functions used to fast backup
+//
+
+// follower call this to get the xTerm,xIndex,xLen
+// conflictIdx is the prevLog index given by leader
+func (rf *Raft) getBackUpPara(conflictIdx int) (int, int, int) {
+	xLen := len(rf.logs)
+	if xLen == 0 {
+		return -1, -1, 0
+	}
+	// incase conflict idx >= len(rf.logs)
+	conflictIdx = min(conflictIdx, len(rf.logs)-1)
+	xTerm := rf.logs[conflictIdx].Term
+	// use binary search to find to first confict Idx
+	xIndex, l, r := -1, 0, conflictIdx
+	for l <= r {
+		mid := (l+r)/2
+		if rf.logs[mid].Term == xTerm {
+			xIndex = mid
+			r = mid - 1
+		} else if rf.logs[mid].Term < xTerm {
+			l = mid + 1
+		}
+	}
+	return xTerm, xIndex, xLen
+}
+
+// leader use this to detect the nextIdx quickly
+func (rf *Raft) getNextIndex(xTerm int, xIndex int, xLen int) int {
+	if xIndex < 0 {
+		return 0
+	}
+	nextIndex := xIndex
+	rightBound := min(xLen-1,len(rf.logs)-1)
+	for nextIndex <= rightBound && rf.logs[nextIndex].Term == xTerm {
+		nextIndex += 1
+	}
+	return nextIndex
 }
 
 func min(a, b int) int {
