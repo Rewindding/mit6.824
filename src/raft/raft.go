@@ -22,7 +22,7 @@ import "sync/atomic"
 import "../labrpc"
 import "time"
 import "math/rand"
-// import "log"
+import "log"
 import "bytes"
 import "../labgob"
 
@@ -76,6 +76,7 @@ func (rf *Raft) SetElectionTO(newTimeout int) {
 //
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	cemu      sync.Mutex          // commit entry mutex
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -242,6 +243,7 @@ func (rf* Raft) AppendEntries() {
 		return
 	}
 	rf.mu.Unlock()
+	//log.Printf("leader:%v,send append entries,leadercommit:%v,last apply:%v,loglen:%v",rf.me,rf.commitIndex,rf.lastApplied,len(rf.logs))
 	for i , _ := range rf.peers {
 		if i == rf.me {
 			continue
@@ -283,12 +285,14 @@ func (rf* Raft) AppendEntries() {
 			}
 			if !reply.Success {
 				// not success
+				// log.Printf("server:%v,AE failed",server)
 				rf.nextIndex[server] = rf.getNextIndex(reply.XTerm, reply.XIndex, reply.XLen)
 				// if out of order response(stale response) arrive, this could be wrong?
 				// rf.nextIndex shoud at leadst more than matchIndex
 				rf.nextIndex[server] = max(rf.nextIndex[server],rf.matchIndex[server]+1)
 			} else {
 				// update match index
+				// log.Printf("server:%v,AE succeed",server)
 				if args.PreLogIndex + len(entries) > rf.matchIndex[server] {
 					rf.matchIndex[server] = args.PreLogIndex + len(entries)
 				}
@@ -304,6 +308,7 @@ func (rf* Raft) AppendEntries() {
 				// commit entries
 				rf.commitEntries()
 			}
+			// log.Printf("Leader commit:%v,log len:%v",rf.commitIndex,len(rf.logs))
 			//log.Printf("[%v] leader%v, server %v,nextIdx:%v",rf.term,rf.me,server,rf.nextIndex[server])
 		}(i, rf)	
 	}
@@ -314,7 +319,7 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntriesArgs, reply *AppendEntries
 	// get the preLogindex and pre log term 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	
+	// log.Printf("0.s%v,receive append entries",rf.me)
 	// prepare param
 	reply.Term = rf.term
 	reply.Success = false
@@ -325,7 +330,7 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntriesArgs, reply *AppendEntries
 	if args.Term < rf.term {
 		return
 	}
-
+	// log.Printf("1.s%v,receive append entries",rf.me)
 	// reset the election timeout, thread safe, already aquire the lock
 	rf.electionTimeout = GetRandTimeOut()
 
@@ -335,13 +340,14 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntriesArgs, reply *AppendEntries
 	}
 
 	rf.state = Follower // turn to a follower if it's a candidate
-
+	// log.Printf("2.s%v,receive append entries",rf.me)
 	// log consistency check
 	if len(rf.logs)-1 < args.PreLogIndex || prelogterm != args.PreLogTerm { 
-		// log.Printf("[%v]leader%v server%v,log consistency check failed,a.preLogidx:%v,a.preterm:%v",rf.term,args.LeaderId,rf.me,args.PreLogIndex,args.PreLogTerm)
+		log.Printf("[%v]leader%v server%v,log consistency check failed,a.preLogidx:%v,a.preterm:%v",rf.term,args.LeaderId,rf.me,args.PreLogIndex,args.PreLogTerm)
 		reply.XTerm, reply.XIndex, reply.XLen = rf.getBackUpPara(args.PreLogIndex)
 		return
 	}
+	// log.Printf("3.s%v,receive append entries",rf.me)
 	// only if log entry confilicts can we delete the logs in the follower
 	pos := args.PreLogIndex + 1
 	hasconflict := false
@@ -359,6 +365,7 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntriesArgs, reply *AppendEntries
 	if hasconflict {
 		rf.logs = rf.logs[:args.PreLogIndex+1+len(args.Entries)]
 	}
+	// log.Printf("4.s%v,receive append entries",rf.me)
 	rf.persist()
 	// set commitIndex carefully or will risk excuting wrong logs
 	if args.LeaderCommit > rf.commitIndex {
@@ -367,6 +374,7 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntriesArgs, reply *AppendEntries
 		rf.commitEntries()
 	}
 	// reply
+	// log.Printf("5.s%v,receive append entries",rf.me)
 	// log.Printf("[%v] server[%v],accept AE from %v,PrelogIdx:%v,PrelogTerm:%v,entries:%v",rf.term,rf.me,args.LeaderId,args.PreLogIndex,args.PreLogTerm,rf.logs)
 	reply.Success = true
 	return
@@ -378,6 +386,7 @@ func (rf* Raft) KickOffElection() {
 	// should lock the whole raft when election ?? no ,candidate still need to handle append entry rpc
 	// prepare args
 	// reset election timeout and start a election
+	// log.Printf("term[%v] server[%v],start election",rf.term,rf.me)
 	rf.term++
 	rf.state = Candidate
 	rf.votedFor = -1 //
@@ -636,9 +645,12 @@ func (rf *Raft) getLeaderCommit() int {
 
 // apply commited entries need higher level locks
 func (rf *Raft) commitEntries(){
+	// rf.cemu.Lock()
+	// defer rf.cemu.Unlock()
 	// apply command if commit index > apply index
 	// log.Printf("[%v],server[%v],commit entries,lastApply:%v,commitIdx:%v",rf.term,rf.me,rf.lastApplied,rf.commitIndex)
 	for rf.commitIndex > rf.lastApplied {
+		// log.Printf("server:%v,send to channel",rf.me)
 		rf.lastApplied += 1
 		cmdIdx := rf.lastApplied
 		rf.applyCh <- ApplyMsg{

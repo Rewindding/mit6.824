@@ -7,6 +7,7 @@ import (
 	"../raft"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = 0
@@ -23,6 +24,10 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	OpName string
+	Key string
+	Value string
+	Id int
 }
 
 type KVServer struct {
@@ -35,15 +40,78 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	// in-memory map to store k-v data?
+	kvStore map[string]string
+	requestLock sync.Mutex
+	requestCond* sync.Cond
+	currentLogIndex int // current log index read from applyCh
+	currentOp Op // current op
 }
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	// receive a client get request
+	// reads are handled by leader only
+	op := Op {
+		OpName : "Get",
+		Key : args.Key,
+	}
+	logIndex, _, isLeader := kv.rf.Start(op)
+	reply.Value = "";
+	reply.Err = ErrNoKey
+	if !isLeader {
+		//log.Printf("server:%v not leader\n",kv.me)
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// wait this log get replicated to majoraty server and committed
+	kv.requestLock.Lock()
+	defer kv.requestLock.Unlock()
+	for kv.currentLogIndex != logIndex {
+		kv.requestCond.Wait()
+	}
+	// judge if the server is still leader
+	if kv.currentOp != op {
+		// excution failed
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// return result
+	reply.Err = OK
+	reply.Value = kv.kvStore[op.Key]
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op {
+		OpName : args.Op,
+		Key : args.Key,
+		Value : args.Value,
+	}
+	logIndex, _, isLeader := kv.rf.Start(op)
+	reply.Err = ErrNoKey
+	if !isLeader {
+		//log.Printf("server:%v not leader\n",kv.me)
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// wait this log get replicated to majoraty server and committed
+	kv.requestLock.Lock()
+	defer kv.requestLock.Unlock()
+	for kv.currentLogIndex != logIndex {
+		// log.Printf("condition failed,currentLogIndex:%v,logIndex:%v",kv.currentLogIndex,logIndex)
+		kv.requestCond.Wait()
+	}
+	// log.Printf("wake")
+	// judge if the server is still leader,should judge term and call State()??
+	if kv.currentOp != op {
+		// excution failed
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// return result
+	reply.Err = OK
 }
 
 //
@@ -91,11 +159,37 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-
+	// create condi variable,used for handle request
+	kv.requestLock = sync.Mutex{}
+	kv.requestCond = sync.NewCond(&kv.requestLock)
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
+	kv.kvStore = make(map[string]string)
 	// You may need initialization code here.
-
+	// should each server need to start a go routine and listen to the appyCh??...
+	go func(kv* KVServer) {
+		for !kv.killed() {
+			// read from apply msg channel
+			// log.Printf("server:%v, read from ch blocked",me)
+			logEntry := <- kv.applyCh
+			// log.Printf("server:%v, unblocked",me)
+			command := logEntry.Command.(Op)
+			kv.requestLock.Lock()
+			
+			// apply this command to kv store
+			if command.OpName == "Put" {
+				kv.kvStore[command.Key] = command.Value
+			} else if command.OpName == "Append" {
+				kv.kvStore[command.Key] += command.Value
+			}
+			// notify All request threads to process, but only exactly one thread will be excuted...opt?
+			kv.currentLogIndex = logEntry.CommandIndex
+			// log.Printf("server %c,read from ch,cmdIndex:%v",kv.me,kv.currentLogIndex)
+			kv.currentOp = command
+			kv.requestCond.Broadcast()
+			kv.requestLock.Unlock()
+		}
+	}(kv)
+	time.Sleep(100*time.Millisecond)
 	return kv
 }

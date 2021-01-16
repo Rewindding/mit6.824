@@ -3,11 +3,15 @@ package kvraft
 import "../labrpc"
 import "crypto/rand"
 import "math/big"
-
+import "log"
+import "sync"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	mu sync.Mutex
+	requestId int
+	clientId int // how to generate unique client id??
 }
 
 func nrand() int64 {
@@ -37,9 +41,24 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
+	log.Printf("get request,key:%v\n",key)
 	// You will have to modify this function.
-	return ""
+	reply := GetReply {}
+	for reply.Err != OK {
+		for _, server := range(ck.servers) {
+			args := GetArgs {
+				Key : key,
+			}
+			res := server.Call("KVServer.Get",&args,&reply)
+			if !res {
+				continue
+			}
+			if reply.Err == OK {
+				break
+			}
+		}
+	}
+	return reply.Value
 }
 
 //
@@ -54,6 +73,25 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	log.Printf("%v request,key:%v,value:%v",op,key,value)
+	reply := PutAppendReply {}
+	for reply.Err != OK {
+		for _, server := range(ck.servers) {
+			args := PutAppendArgs {
+				Op : op,
+				Key : key,
+				Value : value,
+			}
+			res := server.Call("KVServer.PutAppend",&args,&reply)
+			if !res {
+				continue
+			}
+			if reply.Err == OK {
+				return
+			}
+		}
+	}
+	// how to return response to client ?
 }
 
 func (ck *Clerk) Put(key string, value string) {
@@ -61,4 +99,8 @@ func (ck *Clerk) Put(key string, value string) {
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+func (ck *Clerk) getRequestId() {
+	
 }
