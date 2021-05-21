@@ -1,17 +1,22 @@
 package kvraft
 
-import "../labrpc"
+import (
+	"../labrpc"
+)
 import "crypto/rand"
 import "math/big"
-import "log"
 import "sync"
+
+var ClientId int = 0
+var idLock sync.Mutex
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	mu sync.Mutex
-	requestId int
-	clientId int // how to generate unique client id??
+	mu         sync.Mutex
+	requestId  int
+	clientId   int // how to generate unique client id??
+	lastLeader int
 }
 
 func nrand() int64 {
@@ -25,6 +30,11 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	idLock.Lock()
+	defer idLock.Unlock()
+	ck.clientId = ClientId
+	ClientId++
+	ck.lastLeader = 0
 	return ck
 }
 
@@ -41,21 +51,37 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-	log.Printf("get request,key:%v\n",key)
+	// log.Printf("get request,key:%v\n",key)
 	// You will have to modify this function.
-	reply := GetReply {}
+	reply := GetReply{}
+	ck.mu.Lock()
+	reqId := ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
+	// 先请求last Leader
+	args := GetArgs{
+		Key:       key,
+		ClientId:  ck.clientId,
+		RequestId: reqId,
+	}
+	leaderServer := ck.servers[ck.lastLeader]
+
 	for reply.Err != OK {
-		for _, server := range(ck.servers) {
-			args := GetArgs {
-				Key : key,
-			}
-			res := server.Call("KVServer.Get",&args,&reply)
+		res := leaderServer.Call("KVServer.Get", &args, &reply)
+		if res && reply.Err == OK {
+			return reply.Value
+		}
+		for idx, server := range ck.servers {
+			res = server.Call("KVServer.Get", &args, &reply)
+			DPrintf("get,res:%v,reply.Err:%v", res, reply.Err)
 			if !res {
 				continue
 			}
 			if reply.Err == OK {
+				ck.lastLeader = idx
 				break
 			}
+			// log.Printf("retry get")
 		}
 	}
 	return reply.Value
@@ -73,22 +99,36 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	log.Printf("%v request,key:%v,value:%v",op,key,value)
-	reply := PutAppendReply {}
+	// log.Printf("%v request,key:%v,value:%v",op,key,value)
+
+	reply := PutAppendReply{}
+	ck.mu.Lock()
+	reqId := ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
+	args := PutAppendArgs{
+		Op:        op,
+		Key:       key,
+		Value:     value,
+		ClientId:  ck.clientId,
+		RequestId: reqId,
+	}
+	lastLeader := ck.servers[ck.lastLeader]
 	for reply.Err != OK {
-		for _, server := range(ck.servers) {
-			args := PutAppendArgs {
-				Op : op,
-				Key : key,
-				Value : value,
-			}
-			res := server.Call("KVServer.PutAppend",&args,&reply)
+		res := lastLeader.Call("KVServer.PutAppend", &args, &reply)
+		if res && reply.Err == OK {
+			return
+		}
+		for idx, server := range ck.servers {
+			res = server.Call("KVServer.PutAppend", &args, &reply)
 			if !res {
 				continue
 			}
 			if reply.Err == OK {
+				ck.lastLeader = idx
 				return
 			}
+			// log.Printf("retry put append")
 		}
 	}
 	// how to return response to client ?
@@ -102,5 +142,5 @@ func (ck *Clerk) Append(key string, value string) {
 }
 
 func (ck *Clerk) getRequestId() {
-	
+
 }
