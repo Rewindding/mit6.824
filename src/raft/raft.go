@@ -27,12 +27,10 @@ import "math/rand"
 import "bytes"
 import "../labgob"
 
-type State string
-
 const (
-	Follower  State = "follower"
-	Candidate State = "candidate"
-	Leader    State = "leader"
+	Follower  int32 = 0
+	Candidate int32 = 1
+	Leader    int32 = 2
 )
 
 //
@@ -55,22 +53,13 @@ type ApplyMsg struct {
 //
 // log entry
 type LogEntry struct {
-	Term    int         // term
+	Term    int32       // term
 	Index   int         // index
 	Command interface{} //command
 }
 
-func GetRandTimeOut() int {
-	return rand.Intn(200) + 110
-}
-
-// function that reset the election timeout
-func (rf *Raft) SetElectionTO(newTimeout int) {
-	// election timeout milli second range from 10 to 500
-	// lock ? TODO: concurrency control
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.electionTimeout = newTimeout
+func GetRandTimeOut() int64 {
+	return int64(rand.Intn(200) + 110)
 }
 
 //
@@ -87,13 +76,13 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	state           State      // candidate follower leader
-	term            int        // term number
+	state           int32      // candidate follower leader
+	term            int32      // term number
 	votedFor        int        //
 	logs            []LogEntry // logs
 	commitIndex     int        // index of highest log entry known to be commited
 	lastApplied     int        // index of highest log entry known to be applied
-	electionTimeout int        // election timeout milli second range from 10 to 500
+	electionTimeout int64      // election timeout milli second range from 10 to 500
 	//
 	// volatile state on leaders
 	//
@@ -107,9 +96,9 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term := rf.term
-	isleader := (rf.state == Leader)
+	isleader := (atomic.LoadInt32(&rf.state) == Leader)
 	// Your code here (2A).
-	return term, isleader
+	return int(term), isleader
 }
 
 //
@@ -156,10 +145,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term         int //
-	CandidateId  int //
-	LastLogIndex int //
-	LastLogTerm  int //
+	Term         int32 //
+	CandidateId  int   //
+	LastLogIndex int   //
+	LastLogTerm  int32 //
 }
 
 //
@@ -168,8 +157,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int  // current term, for candidate to update itself
-	VoteGranted bool // true means receive a vote
+	Term        int32 // current term, for candidate to update itself
+	VoteGranted bool  // true means receive a vote
 }
 
 //
@@ -207,23 +196,23 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 type AppendEntriesArgs struct {
-	Term         int
+	Term         int32
 	LeaderId     int
 	PreLogIndex  int
-	PreLogTerm   int // -1 if not prev log
+	PreLogTerm   int32 // -1 if not prev log
 	Entries      []LogEntry
 	LeaderCommit int
 }
 
 // is the two args too few? how the leader know which rpc success ?
 type AppendEntriesReply struct {
-	Term    int
+	Term    int32
 	Success bool
 
 	// parame used for fast backup
-	XTerm  int // term of the conflict entry
-	XIndex int // index of the first entry of the xTerm
-	XLen   int // length of the follower's log
+	XTerm  int32 // term of the conflict entry
+	XIndex int   // index of the first entry of the xTerm
+	XLen   int   // length of the follower's log
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -235,7 +224,7 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *Appe
 func (rf *Raft) AppendEntries() {
 	rf.mu.Lock()
 	// should it hold the lock during the rpc calls ? no !
-	if rf.state != Leader {
+	if atomic.LoadInt32(&rf.state) != Leader {
 		rf.mu.Unlock()
 		return
 	}
@@ -250,7 +239,7 @@ func (rf *Raft) AppendEntries() {
 			entries := []LogEntry{}
 			rf.nextIndex[server] = min(rf.nextIndex[server], len(rf.logs))
 			lastLogIndex := rf.nextIndex[server] - 1
-			lastLogTerm := -1
+			lastLogTerm := int32(-1)
 			if lastLogIndex >= 0 && lastLogIndex < len(rf.logs) {
 				lastLogTerm = rf.logs[lastLogIndex].Term
 			}
@@ -330,14 +319,14 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntriesArgs, reply *AppendEntries
 	}
 	// log.Printf("1.s%v,receive append entries",rf.me)
 	// reset the election timeout, thread safe, already aquire the lock
-	rf.electionTimeout = GetRandTimeOut()
+	atomic.StoreInt64(&rf.electionTimeout, GetRandTimeOut())
 
-	prelogterm := -1
+	prelogterm := int32(-1)
 	if args.PreLogIndex >= 0 && args.PreLogIndex < len(rf.logs) {
 		prelogterm = rf.logs[args.PreLogIndex].Term
 	}
 
-	rf.state = Follower // turn to a follower if it's a candidate
+	atomic.StoreInt32(&rf.state, Follower) // turn to a follower if it's a candidate
 	// log.Printf("2.s%v,receive append entries",rf.me)
 	// log consistency check
 	if len(rf.logs)-1 < args.PreLogIndex || prelogterm != args.PreLogTerm {
@@ -387,11 +376,11 @@ func (rf *Raft) KickOffElection() {
 	// reset election timeout and start a election
 	// log.Printf("term[%v] server[%v],start election",rf.term,rf.me)
 	rf.term++
-	rf.state = Candidate
+	atomic.StoreInt32(&rf.state, Candidate)
 	rf.votedFor = -1 //
 	rf.persist()
 	serverCnt := len(rf.peers)
-	lastLogTerm := 0
+	lastLogTerm := int32(0)
 	if len(rf.logs)-1 >= 0 {
 		lastLogTerm = rf.logs[len(rf.logs)-1].Term
 	}
@@ -406,7 +395,7 @@ func (rf *Raft) KickOffElection() {
 	cond := sync.NewCond(&voteLock)
 	voteCnt := 1 //a candidate vote for itself
 	received := 1
-	maxTerm := -1 // max term number received during election
+	maxTerm := int32(-1) // max term number received during election
 	// concurrently send vote request
 	for i := 0; i < serverCnt; i++ {
 		if i == rf.me {
@@ -434,21 +423,21 @@ func (rf *Raft) KickOffElection() {
 	minority := serverCnt / 2
 	voteLock.Lock()
 	defer voteLock.Unlock()
-	for voteCnt <= minority && received != serverCnt && maxTerm <= rf.term {
+	for voteCnt <= minority && received != serverCnt && maxTerm <= atomic.LoadInt32(&rf.term) {
 		cond.Wait() // wait until get enough votes or election finished or a higher term received
 		// whenever receives a response with higher term, should update term and turn to follower
 		// will cond.wait() release the lock?
 	}
 	rf.mu.Lock() // need to read the term,modify state so lock the rf
 	defer rf.mu.Unlock()
-	if maxTerm > rf.term { //turn to follower
-		rf.term = maxTerm
+	if maxTerm > atomic.LoadInt32(&rf.term) { //turn to follower
+		atomic.StoreInt32(&rf.term, maxTerm)
 		rf.persist()
-		rf.state = Follower
-	} else if voteCnt > minority && args.Term == rf.term && rf.state == Candidate { // make sure now it's still a candidate
+		atomic.StoreInt32(&rf.state, Follower)
+	} else if voteCnt > minority && args.Term == rf.term && atomic.LoadInt32(&rf.state) == Candidate { // make sure now it's still a candidate
 		// become leader
 		// log.Printf("term %v server %v become the leader",rf.term,rf.me)
-		rf.state = Leader
+		atomic.StoreInt32(&rf.state, Leader)
 		// log.Printf("term[%v], server[%v] become the leader,servercnt:%v,leaderlog:%v",rf.term,rf.me,serverCnt,rf.logs)
 		// initial nextIndex and matchIndex array
 		rf.nextIndex = []int{}
@@ -487,7 +476,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	rf.updateTerm(args.Term, -1)
 	// only follower can vote
-	if rf.state != Follower {
+	if atomic.LoadInt32(&rf.state) != Follower {
 		// log.Printf("term[%v],server[%d]: server not in follower state,reject to vote server %v",rf.term,rf.me,args.CandidateId)
 		return
 	}
@@ -496,10 +485,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	// should reset timeout here
-	rf.electionTimeout = GetRandTimeOut()
+	atomic.StoreInt64(&rf.electionTimeout, GetRandTimeOut())
 	// vote restriction
 	lastLogIndex := len(rf.logs) - 1
-	lastLogTerm := -1
+	lastLogTerm := int32(-1)
 	if lastLogIndex >= 0 {
 		lastLogTerm = rf.logs[lastLogIndex].Term
 	}
@@ -528,14 +517,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // term. the third return value is true if this server believes it is
 // the leader.
 //
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
+func (rf *Raft) Start(command interface{}) (int, int32, bool) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// what should the start function do with the command ???
 	index := -1
 	term := rf.term
-	isLeader := (rf.state == Leader)
+	isLeader := (atomic.LoadInt32(&rf.state) == Leader)
 	if !isLeader {
 		return index, term, isLeader
 	}
@@ -605,22 +594,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.commitIndex = -1
 	rf.lastApplied = -1
-	rf.state = Follower
+	atomic.StoreInt32(&rf.state, Follower)
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start a background go routine to kick off election peridically
-	rf.SetElectionTO(GetRandTimeOut())
+	atomic.StoreInt64(&rf.electionTimeout, GetRandTimeOut())
 	go func(rf *Raft) {
 		// how to gracefully implements the election timeout??
 		for !rf.killed() { // leader dont't need election timeout
 			time.Sleep(10 * time.Millisecond)
-			rf.electionTimeout -= 10
-			if rf.electionTimeout <= 0 { // start a election
-				rf.SetElectionTO(GetRandTimeOut())
-				if rf.state != Leader {
+			atomic.AddInt64(&rf.electionTimeout, -10)
+			if atomic.LoadInt64(&rf.electionTimeout) <= 0 { // start a election
+				atomic.StoreInt64(&rf.electionTimeout, GetRandTimeOut())
+				if atomic.LoadInt32(&rf.state) != Leader {
 					// log.Printf("term[%v] server %v start election",rf.term,rf.me)
 					go rf.KickOffElection()
 				}
@@ -685,12 +674,12 @@ func (rf *Raft) commitEntries() {
 
 // whenever receive a term , this should be called
 // return true if recTerm > rf.term
-func (rf *Raft) updateTerm(rcvTerm, serverId int) bool {
-	if rcvTerm <= rf.term {
+func (rf *Raft) updateTerm(rcvTerm int32, serverId int) bool {
+	if rcvTerm <= atomic.LoadInt32(&rf.term) {
 		return false
 	}
-	rf.term = rcvTerm
-	rf.state = Follower
+	atomic.StoreInt32(&rf.term, rcvTerm)
+	atomic.StoreInt32(&rf.state, Follower)
 	rf.votedFor = serverId
 	rf.persist()
 	return true
@@ -702,7 +691,7 @@ func (rf *Raft) updateTerm(rcvTerm, serverId int) bool {
 
 // follower call this to get the xTerm,xIndex,xLen
 // conflictIdx is the prevLog index given by leader
-func (rf *Raft) getBackUpPara(conflictIdx int) (int, int, int) {
+func (rf *Raft) getBackUpPara(conflictIdx int) (int32, int, int) {
 	xLen := len(rf.logs)
 	if xLen == 0 {
 		return -1, -1, 0
@@ -725,7 +714,7 @@ func (rf *Raft) getBackUpPara(conflictIdx int) (int, int, int) {
 }
 
 // leader use this to detect the nextIdx quickly
-func (rf *Raft) getNextIndex(xTerm int, xIndex int, xLen int) int {
+func (rf *Raft) getNextIndex(xTerm int32, xIndex int, xLen int) int {
 	if xIndex < 0 {
 		return 0
 	}
