@@ -217,17 +217,19 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				DPrintf("read a dummy log:%v", logEntry.Command.(string))
 				continue
 			}
-			// apply this command to kv store
-			if command.OpName == "Put" {
-				kv.kvStore[command.Key] = command.Value
-			} else if command.OpName == "Append" {
-				// 存在这样的情况，已经被执行了但是还是再次被append到log里面，这里也要判断如果已经被执行了就不再执行
-				_, loaded := kv.excutedReq.LoadOrStore(command.RequestId, true)
-				if !loaded {
+			// Get无论如何都直接执行
+			if command.OpName == "Get" {
+				command.Value = kv.kvStore[command.Key]
+			}
+			// 存在这样的情况，已经被执行了但是因为reponse丢了，重试请求，重新被append到log里面，这里也要判断如果已经被执行了就不再执行
+			_, loaded := kv.excutedReq.LoadOrStore(command.RequestId, true)
+			if !loaded {
+				// apply this command to kv store
+				if command.OpName == "Put" {
+					kv.kvStore[command.Key] = command.Value
+				} else if command.OpName == "Append" {
 					kv.kvStore[command.Key] += command.Value
 				}
-			} else if command.OpName == "Get" {
-				command.Value = kv.kvStore[command.Key]
 			}
 			// 把op放到对应channel里面去
 			ch, ok := kv.channelMap.Load(logEntry.CommandIndex)
