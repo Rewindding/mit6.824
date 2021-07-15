@@ -4,6 +4,7 @@ import (
 	"../labgob"
 	"../labrpc"
 	"../raft"
+	"bytes"
 	"fmt"
 	"log"
 	"sync"
@@ -14,7 +15,7 @@ import (
 const (
 	Debug = 0
 	// raft timeout 的原因可能是网络失败，可能是当前服务器已经不再是leader了,原因不确定
-	RaftTimeOut = time.Millisecond * 200
+	RaftTimeOut = time.Millisecond * 300
 )
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -41,6 +42,8 @@ type KVServer struct {
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
+
+	persister *raft.Persister
 
 	maxraftstate int // snapshot if log grows this big
 
@@ -78,7 +81,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	_, loaded := kv.channelMap.LoadOrStore(logIndex, ch)
 	if loaded {
-		panic("unhandled problem: duplicate log index")
+		log.Printf("unhandled problem: duplicate log index:%v", logIndex)
+		// panic("unhandled problem: duplicate log index")
 		// TODO it's said maybe same log index appear more than once!?
 	}
 	defer kv.channelMap.Delete(logIndex)
@@ -97,6 +101,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		}
 	case <-time.After(RaftTimeOut):
 		{
+			// log.Printf("log idx:%v timeout", logIndex)
 			reply.Err = ErrTimeout
 			return
 		}
@@ -128,7 +133,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	ch := make(chan Op)
 	_, loaded := kv.channelMap.LoadOrStore(logIndex, ch)
 	if loaded {
-		panic("unhandled problem: duplicate log index")
+		log.Printf("unhandled problem: duplicate log index:%v", logIndex)
+		// panic("unhandled problem: duplicate log index")
 		// TODO it's said maybe same log index appear more than once!?
 	}
 	defer kv.channelMap.Delete(logIndex)
@@ -148,6 +154,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		}
 	case <-time.After(RaftTimeOut):
 		{
+			// log.Printf("log idx:%v timeout", logIndex)
 			reply.Err = ErrTimeout
 			return
 		}
@@ -203,7 +210,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// create condi variable,used for handle request
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.kvStore = make(map[string]string)
+	kv.persister = persister
+	// 从persister恢复
+	kv.readPersist(persister.ReadSnapshot())
 	// You may need initialization code here.
 	// should each server need to start a go routine and listen to the applyCh??...
 	go func(kv *KVServer) {
@@ -212,6 +221,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			// log.Printf("server:%v, read from ch blocked",me)
 			logEntry := <-kv.applyCh
 			// log.Printf("server:%v, unblocked",me)
+			if !logEntry.CommandValid { // snapshot command
+				//log.Printf("kv app receive snapshot")
+				snapshotData, ok := logEntry.Command.([]byte)
+				if !ok {
+					panic("err")
+				}
+				kv.readPersist(snapshotData)
+				continue
+			}
 			command, ok := logEntry.Command.(Op)
 			if !ok { // type assertion failed
 				DPrintf("read a dummy log:%v", logEntry.Command.(string))
@@ -234,11 +252,57 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			// 把op放到对应channel里面去
 			ch, ok := kv.channelMap.Load(logEntry.CommandIndex)
 			if ok { // only leader need to do this
-				DPrintf("notify idx:%v", logEntry.CommandIndex)
+				// log.Printf("notify idx:%v", logEntry.CommandIndex)
 				ch.(chan Op) <- command
+			}
+			// 在这里make snapshot
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
+				// 获取kv存储的数据，
+				appData := kv.getSnapshot(logEntry.CommandIndex - 1)
+				// command index start from 1
+				log.Printf("make app snapshot,lastApplied:%v", logEntry.CommandIndex-1)
+				go kv.rf.MakeSnapshot(appData, logEntry.CommandIndex-1, logEntry.LogTerm)
+				// log.Printf("server:%v,before size:%v,after size:%v,max:%v",me,beforeSize,kv.persister.RaftStateSize(),kv.maxraftstate)
 			}
 		}
 	}(kv)
 	time.Sleep(100 * time.Millisecond)
 	return kv
+}
+
+func (kv *KVServer) readPersist(data []byte) {
+	kv.kvStore = make(map[string]string)
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&kv.kvStore) != nil {
+		kv.kvStore = make(map[string]string)
+	}
+	if kv.kvStore == nil {
+		panic("nil map error")
+	}
+	executedReqArr := []string{}
+	d.Decode(&executedReqArr)
+	kv.excutedReq.Range(func(key, value interface{}) bool {
+		kv.excutedReq.Delete(key)
+		return true
+	})
+	for _, reqId := range executedReqArr {
+		kv.excutedReq.Store(reqId, true)
+	}
+}
+
+func (kv *KVServer) getSnapshot(lastApplied int) []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kvStore)
+	executedReq := []string{}
+	kv.excutedReq.Range(func(key interface{}, value interface{}) bool {
+		executedReq = append(executedReq, key.(string))
+		return true
+	})
+	e.Encode(executedReq)
+	return w.Bytes()
 }
