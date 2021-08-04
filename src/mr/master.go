@@ -5,14 +5,135 @@ import "net"
 import "os"
 import "net/rpc"
 import "net/http"
+import "time"
+import "sync"
 
-
+type TaskState struct {
+	state int // task state 0:idel 1:in progress 2:done
+	startTime time.Time // task started time 
+}
+// return true if the task timeout 
+func (t *TaskState) isTimeOut() bool { 
+	// represents the elapsed time between two instants as an int64 nanosecond count.
+	elapsed := time.Now().Sub(t.startTime)
+	return elapsed>(10*time.Second)
+}
+// set task state = 1 ,start time = now 
+func (t *TaskState) setInProgress() {
+	t.state = 1;
+	t.startTime = time.Now()
+}
+func (t *TaskState) excutable() bool {
+	return t.state==0||(t.state==1&&t.isTimeOut())
+}
 type Master struct {
 	// Your definitions here.
-
+	nMap int // number of map task
+	nReduce int // number of reduce task
+	inputFiles []string // input file names
+	mapTaskState []TaskState 
+	reduceTaskState []TaskState
+	finishedMapTaskCnt int // number of finished map task
+	finishedReduceTaskCnt int // number of finished reduce task
+	isDone bool // is the task fully done
+	mu sync.Mutex // mutex
+}
+// return true if all map tasks finished
+func (m* Master) isMapTaskFinished() bool {
+	return m.finishedMapTaskCnt == m.nMap
+}
+func (m* Master) setFinished(TaskType string, taskNumber int) bool { 
+	if TaskType == "map" {
+		if m.mapTaskState[taskNumber].state == 2 {
+			//already finished
+			return false
+		}
+		log.Printf("map task:%v finised",taskNumber)
+		m.mapTaskState[taskNumber].state = 2
+		m.finishedMapTaskCnt++
+	} else if TaskType == "reduce" {
+		if m.reduceTaskState[taskNumber].state == 2 {
+			//already finished
+			return false
+		}
+		log.Printf("reduce task:%v finised",taskNumber)
+		m.reduceTaskState[taskNumber].state = 2
+		m.finishedReduceTaskCnt++
+	} else {
+		return false
+	}
+	return true
 }
 
 // Your code here -- RPC handlers for the worker to call.
+func (m *Master) GetTask(args *TaskApply, reply *TaskReply) error {
+
+	// this function will be called concurrently 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Done() { // all task finished
+		reply.Finished = true
+		return nil
+	}
+	// assemble map task first
+	mapTaskNumber := -1
+	for i:=0;i<m.nMap;i++{
+		if m.mapTaskState[i].excutable() {// task not started or not finished and timeout
+			mapTaskNumber = i	
+			break;
+		}
+	}
+	if mapTaskNumber!=-1 { // assign a map task and return
+		reply.TaskType = "map"
+		reply.TaskNumber = mapTaskNumber
+		reply.InputFileName = m.inputFiles[mapTaskNumber]
+		reply.NMap = m.nMap
+		reply.NReduce = m.nReduce
+		//set start time and state
+		m.mapTaskState[mapTaskNumber].setInProgress()
+		log.Printf("assign a map task number:%v,totall:%v\n",mapTaskNumber,m.nMap);
+		return nil
+	}
+	if(!m.isMapTaskFinished()) {
+		log.Printf("assign a wait task\n");
+		reply.TaskType="wait"
+		return nil
+	}
+	//if map task fully done , assemble reduce task 
+	reduceTaskNumber := -1
+	for i:=0; i<m.nReduce; i++ {
+		if m.reduceTaskState[i].excutable() {// task not started or not finished and timeout
+			reduceTaskNumber = i
+			break
+		}
+	}
+	//no reduce task
+	if reduceTaskNumber==-1 {
+		return nil
+	}
+	// assign a reduce task
+	reply.TaskType = "reduce"
+	reply.TaskNumber = reduceTaskNumber
+	reply.NMap = m.nMap
+	reply.NReduce = m.nReduce
+	m.reduceTaskState[reduceTaskNumber].setInProgress()
+	log.Printf("assign a reduce task number:%v\n",reduceTaskNumber);
+	return nil
+}
+
+// RPC : work call this when a task is done
+func (m* Master) HandinTask(args * TaskHandinApply,reply* string) error {
+	// this function will be called concurrently 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	res := m.setFinished(args.TaskType,args.TaskNumber)
+	if(!res){
+		log.Printf("%v number %v handin failed\n",args.TaskType,args.TaskNumber)
+		// return error
+	}
+	log.Printf("%v number %v handin succeed\n",args.TaskType,args.TaskNumber)
+	return nil
+}
 
 //
 // an example RPC handler.
@@ -46,12 +167,8 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := false
-
 	// Your code here.
-
-
-	return ret
+	return m.finishedMapTaskCnt==m.nMap&&m.finishedReduceTaskCnt==m.nReduce
 }
 
 //
@@ -63,8 +180,13 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
 	// Your code here.
-
-
+	m.nMap=len(files)
+	m.nReduce=nReduce
+	m.inputFiles=files // cppy array
+	m.mapTaskState = make([]TaskState,m.nMap,m.nMap)
+	m.reduceTaskState = make([]TaskState,nReduce,nReduce)
+	m.isDone = false
+	log.Printf("new master: nMap:%v,nReducer:%v\n",m.nMap,m.nReduce)
 	m.server()
 	return &m
 }
