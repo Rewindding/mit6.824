@@ -260,7 +260,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				// 获取kv存储的数据，
 				appData := kv.getSnapshot(logEntry.CommandIndex - 1)
 				// command index start from 1
-				log.Printf("make app snapshot,lastApplied:%v", logEntry.CommandIndex-1)
+				// log.Printf("make app snapshot,lastApplied:%v", logEntry.CommandIndex-1)
 				go kv.rf.MakeSnapshot(appData, logEntry.CommandIndex-1, logEntry.LogTerm)
 				// log.Printf("server:%v,before size:%v,after size:%v,max:%v",me,beforeSize,kv.persister.RaftStateSize(),kv.maxraftstate)
 			}

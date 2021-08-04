@@ -35,6 +35,7 @@ const (
 
 	DummyLogTerm  int32 = -1
 	DummyLogIndex int   = -1
+	DummyLogType        = "dummyLog"
 )
 
 //
@@ -261,7 +262,6 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int32
 	Success bool
-
 	// parame used for fast backup
 	XTerm  int32 // term of the conflict entry
 	XIndex int   // index of the first entry of the xTerm
@@ -289,6 +289,10 @@ func (rf *Raft) AppendEntries() {
 		}
 		go func(server int, rf *Raft) {
 			rf.mu.Lock()
+			if atomic.LoadInt32(&rf.state) != Leader {
+				rf.mu.Unlock()
+				return
+			}
 			entries := []LogEntry{}
 			logLen := rf.getLogLen()
 
@@ -327,11 +331,12 @@ func (rf *Raft) AppendEntries() {
 			// handle response, should handle concurrency control
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			if rf.term != args.Term { // stale response
-				return
-			}
 			// if a bigger term received
 			if rf.updateTerm(reply.Term, server) {
+				return
+			}
+			if rf.term != args.Term || (reply.Success && reply.Term != args.Term) { // stale response
+				// log.Printf("response inconsistency problem,rfTerm:%v,argsTerm:%v,rspTerm:%v,succeed:%v",rf.term,args.Term,reply.Term,reply.Success)
 				return
 			}
 			if !reply.Success {
@@ -370,9 +375,13 @@ func (rf *Raft) AppendEntries() {
 				rf.nextIndex[server] = rf.matchIndex[server] + 1
 				// update leader's commit index
 				if rf.matchIndex[server] > rf.commitIndex {
-					newCommitIndex := rf.getLeaderCommit()
-					if newCommitIndex > rf.commitIndex && rf.getLastLogTerm() == rf.term { // leader only update commited entry in his term
-						rf.commitIndex = newCommitIndex
+					newCommitIndex, cnt := rf.getLeaderCommit()
+					if newCommitIndex > rf.commitIndex { // leader only update commited entry in his term
+						fullReplicated := cnt == len(rf.peers)
+						canCommit := rf.isLogIndexInBound(newCommitIndex) && rf.getEntryAt(newCommitIndex).Term == rf.term
+						if fullReplicated || canCommit {
+							rf.commitIndex = newCommitIndex
+						}
 					}
 				}
 				// commit entries
@@ -427,7 +436,7 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntriesArgs, reply *AppendEntries
 	// log.Printf("2.s%v,receive append entries",rf.me)
 	// log consistency check
 	if args.PreLogIndex < rf.lastIncludedIndex || rf.getLogLen()-1 < args.PreLogIndex || prevLogTerm != args.PreLogTerm {
-		// log.Printf("[%v]leader%v server%v,log consistency check failed,a.preLogidx:%v,a.preterm:%v",rf.term,args.LeaderId,rf.me,args.PreLogIndex,args.PreLogTerm)
+		// log.Printf("[%v]leader%v server%v,log consistency check failed,a.preLogidx:%v,a.preterm:%v",rf.term,args.LeaderId,rf.me,args.AcceptedPreLogIndex,args.PreLogTerm)
 		reply.XTerm, reply.XIndex, reply.XLen = rf.getBackUpPara(args.PreLogIndex)
 		return
 	}
@@ -440,6 +449,10 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntriesArgs, reply *AppendEntries
 			currentEntry := rf.getEntryAt(pos)
 			if currentEntry.Term != entry.Term {
 				hasconflict = true
+				if entry.Index < rf.commitIndex { // 已经commit的log与leader log不一致
+					// TODO fix bug
+					log.Printf("consistency err,follower[%v]:%v,leader:%v,leaderTerm[%v],serverTerm[%v],leader[%v]", rf.me, currentEntry, entry, args.Term, rf.term, args.LeaderId)
+				}
 			}
 			if pos != entry.Index || pos != currentEntry.Index {
 				log.Printf("pos:%v,entry.Index:%v", pos, entry.Index)
@@ -470,7 +483,7 @@ func (rf *Raft) AppendEntryHandler(args *AppendEntriesArgs, reply *AppendEntries
 	}
 	// reply
 	// log.Printf("5.s%v,receive append entries",rf.me)
-	// log.Printf("[%v] server[%v],accept AE from %v,PrelogIdx:%v,PrelogTerm:%v,entries:%v",rf.term,rf.me,args.LeaderId,args.PreLogIndex,args.PreLogTerm,rf.logs)
+	// log.Printf("[%v] server[%v],accept AE from %v,PrelogIdx:%v,PrelogTerm:%v,entries:%v",rf.term,rf.me,args.LeaderId,args.AcceptedPreLogIndex,args.PreLogTerm,rf.logs)
 	reply.Success = true
 	reply.XLen = rf.getLogLen()
 	return
@@ -492,7 +505,7 @@ func (rf *Raft) KickOffElection() {
 	args := RequestVoteArgs{
 		Term:         rf.term,
 		CandidateId:  rf.me,
-		LastLogIndex: rf.getLogLen(),
+		LastLogIndex: rf.getLogLen() - 1,
 		LastLogTerm:  rf.getLastLogTerm(),
 	}
 	rf.mu.Unlock()
@@ -511,16 +524,18 @@ func (rf *Raft) KickOffElection() {
 			res := rf.sendRequestVote(server, &args, &reply)
 			voteLock.Lock()
 			defer voteLock.Unlock()
+			received++
 			if res {
+				if reply.Term > args.Term && reply.Term > maxTerm {
+					maxTerm = reply.Term
+					cond.Broadcast()
+					return
+				}
 				// store the vote result
 				if reply.VoteGranted {
 					// log.Printf("term[%v] server[%v],get a vote from %v",rf.term,rf.me,server)
 					voteCnt++
 				}
-			}
-			received++
-			if reply.Term > maxTerm {
-				maxTerm = reply.Term
 			}
 			cond.Broadcast()
 		}(i)
@@ -541,14 +556,14 @@ func (rf *Raft) KickOffElection() {
 		atomic.StoreInt32(&rf.state, Follower)
 	} else if voteCnt > minority && args.Term == rf.term && atomic.LoadInt32(&rf.state) == Candidate { // make sure now it's still a candidate
 		// become leader
-		// log.Printf("term %v server %v become the leader",rf.term,rf.me)
+		// log.Printf("term %v server %v become the leader,args:%v",rf.term,rf.me,args)
 		atomic.StoreInt32(&rf.state, Leader)
 		// log.Printf("term[%v], server[%v] become the leader,servercnt:%v,leaderlog:%v",rf.term,rf.me,serverCnt,rf.logs)
 		// initial nextIndex and matchIndex array
 		rf.nextIndex = []int{}
 		rf.matchIndex = []int{}
 		// 如果现在leader最后一个log term比当前term小，主动产生一个dummy log 使得之前的log可以被成功commit
-		if rf.getLastLogTerm() < rf.term {
+		if rf.getLogLen() > 0 && rf.getLastLogTerm() < rf.term {
 			// log.Printf("generate dummy log")
 			// rf.appendDummyLog()
 		}
@@ -571,14 +586,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	reply.Term = rf.term
 	reply.VoteGranted = false
-
 	if args.Term < rf.term {
 		// log.Printf("term[%v],server[%d]: smaller term,reject to vote server %v",rf.term,rf.me,args.CandidateId)
 		return
 	}
 	rf.updateTerm(args.Term, -1)
+	reply.Term = rf.term
 	// only follower can vote
 	if atomic.LoadInt32(&rf.state) != Follower {
 		// log.Printf("term[%v],server[%d]: server not in follower state,reject to vote server %v",rf.term,rf.me,args.CandidateId)
@@ -597,7 +611,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if lastLogTerm > args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
 		return
 	}
-
+	// log.Printf("term[%v],server[%v],vote for server[%v],lastLogTerm[%v],lastLogIndex:%v,args:%v",rf.term,rf.me,args.CandidateId,lastLogTerm,lastLogIndex,args)
 	// vote for the candidate
 	rf.votedFor = args.CandidateId
 	rf.persist()
@@ -652,7 +666,8 @@ func (rf *Raft) appendDummyLog() {
 	rf.logs = append(rf.logs, LogEntry{
 		Index:   index,
 		Term:    rf.term,
-		Command: "dummy log",
+		Command: nil,
+		// CommandValid:
 	})
 	rf.persist()
 }
@@ -736,13 +751,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 //
 // helper functions
-func (rf *Raft) getLeaderCommit() int {
+func (rf *Raft) getLeaderCommit() (int, int) {
 	// using binary search,is there any another graceful solution?
 	left, right, res := max(0, rf.commitIndex), rf.getLogLen()-1, -1
 	majority := len(rf.peers) / 2
+	cnt := 0
 	for left <= right {
 		mid := (left + right) / 2
-		cnt := 0
+		cnt = 0
 		for i := 0; i < len(rf.matchIndex); i++ {
 			if rf.matchIndex[i] >= mid {
 				cnt += 1
@@ -756,7 +772,7 @@ func (rf *Raft) getLeaderCommit() int {
 		}
 	}
 	// log.Printf("leader commit:%v,match index:%v",res,rf.matchIndex)
-	return res
+	return res, cnt + 1
 }
 
 // apply commited entries need higher level locks
