@@ -141,7 +141,11 @@ func (rf *Raft) readPersist(data []byte) {
 	// Example:
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-
+	rf.term = 0
+	rf.votedFor = 0
+	rf.logs = nil
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
 	if d.Decode(&rf.term) != nil ||
 		d.Decode(&rf.votedFor) != nil ||
 		d.Decode(&rf.logs) != nil ||

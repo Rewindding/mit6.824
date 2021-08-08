@@ -273,7 +273,7 @@ loop:
 		close(is)
 
 		for j := 0; j < servers; j++ {
-			if t, _ := cfg.rafts[j].GetState(); t != term {
+			if t, _ := cfg.rafts[j].GetState(); t != int(term) {
 				// term changed -- can't expect low RPC counts
 				continue loop
 			}
@@ -282,7 +282,7 @@ loop:
 		failed := false
 		cmds := []int{}
 		for index := range is {
-			cmd := cfg.wait(index, servers, term)
+			cmd := cfg.wait(index, servers, int(term))
 			if ix, ok := cmd.(int); ok {
 				if ix == -1 {
 					// peers have moved on to later terms
@@ -499,7 +499,7 @@ loop:
 		}
 
 		for i := 1; i < iters+1; i++ {
-			cmd := cfg.wait(starti+i, servers, term)
+			cmd := cfg.wait(starti+i, servers, int(term))
 			if ix, ok := cmd.(int); ok == false || ix != cmds[i-1] {
 				if ix == -1 {
 					// term changed -- try again
@@ -512,7 +512,7 @@ loop:
 		failed := false
 		total2 = 0
 		for j := 0; j < servers; j++ {
-			if t, _ := cfg.rafts[j].GetState(); t != term {
+			if t, _ := cfg.rafts[j].GetState(); t != int(term) {
 				// term changed -- can't expect low RPC counts
 				// need to keep going to update total2
 				failed = true
